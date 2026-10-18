@@ -8,10 +8,15 @@ import com.tom_roush.pdfbox.pdmodel.PDDocumentInformation
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+
+data class MetaField(val label: String, val value: String)
+
+class CleanReport(val before: List<MetaField>, val after: List<MetaField>, val changed: Boolean)
 
 object MetadataCleaner {
 
@@ -41,6 +46,131 @@ object MetadataCleaner {
 
     fun extensionOf(name: String) = name.substringAfterLast('.', "").lowercase()
     fun isSupported(name: String) = extensionOf(name) in mimeByExt
+
+    // ---------------- inspection (what metadata does the file contain?) ----------------
+
+    private val coreTags = listOf(
+        "creator" to "Author", "lastModifiedBy" to "Last modified by", "title" to "Title",
+        "subject" to "Subject", "keywords" to "Keywords", "description" to "Comments",
+        "category" to "Category", "contentStatus" to "Status", "identifier" to "Identifier",
+        "created" to "Created on", "modified" to "Modified on", "lastPrinted" to "Last printed",
+        "revision" to "Revision count"
+    )
+    private val dateTags = setOf("created", "modified", "lastPrinted")
+    private val appTags = listOf(
+        "Application" to "Created with", "AppVersion" to "App version", "Company" to "Company",
+        "Manager" to "Manager", "Template" to "Template", "HyperlinkBase" to "Hyperlink base"
+    )
+    private val statTags = listOf(
+        "Pages", "Words", "Characters", "CharactersWithSpaces", "Lines", "Paragraphs",
+        "Slides", "Notes", "HiddenSlides", "TotalTime"
+    )
+    private val pdfDateRegex = Regex("""D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?""")
+
+    /** Lists the metadata found in the file. An empty list means the file is clean. */
+    fun inspect(ctx: Context, input: Uri, name: String): List<MetaField> {
+        val ext = extensionOf(name)
+        if (ext !in mimeByExt) error("Unsupported file type (.$ext)")
+        val ins = ctx.contentResolver.openInputStream(input) ?: error("Cannot read the file")
+        return ins.use { if (ext == "pdf") inspectPdf(it) else inspectOoxml(it) }
+    }
+
+    /** Inspects, cleans in place only if needed, then inspects again to verify. */
+    fun cleanAndReport(ctx: Context, input: Uri, name: String): CleanReport {
+        val before = inspect(ctx, input, name)
+        if (before.isEmpty()) return CleanReport(before, before, false)
+        clean(ctx, input, name)
+        val after = inspect(ctx, input, name)
+        return CleanReport(before, after, true)
+    }
+
+    private fun shorten(v: String): String {
+        val t = v.trim().replace(Regex("\\s+"), " ")
+        return if (t.length > 70) t.take(70) + "..." else t
+    }
+
+    private fun pdfDate(v: String): String {
+        val m = pdfDateRegex.find(v) ?: return v
+        val g = m.groupValues
+        val date = listOf(g[1], g[2].ifEmpty { "01" }, g[3].ifEmpty { "01" }).joinToString("-")
+        return if (g[4].isNotEmpty()) "$date ${g[4]}:${g[5].ifEmpty { "00" }}" else date
+    }
+
+    private fun pdfLabel(k: String) = when (k) {
+        "Creator" -> "Created with"
+        "Producer" -> "PDF producer"
+        "CreationDate" -> "Created on"
+        "ModDate" -> "Modified on"
+        else -> k
+    }
+
+    private fun inspectPdf(ins: InputStream): List<MetaField> {
+        val out = ArrayList<MetaField>()
+        PDDocument.load(ins).use { doc ->
+            if (doc.isEncrypted) error("Encrypted PDF is not supported")
+            val info = doc.documentInformation
+            for (key in info.metadataKeys) {
+                val v = info.getCustomMetadataValue(key)
+                if (!v.isNullOrBlank()) {
+                    val shown = if (key.endsWith("Date")) pdfDate(v) else v
+                    out.add(MetaField(pdfLabel(key), shorten(shown)))
+                }
+            }
+            if (doc.documentCatalog.metadata != null) out.add(MetaField("XMP metadata", "embedded block"))
+        }
+        return out
+    }
+
+    private fun xmlValue(xml: String, tag: String): String? {
+        val m = Regex("<(?:[A-Za-z0-9]+:)?$tag\\b[^>]*>([^<]*)</(?:[A-Za-z0-9]+:)?$tag>").find(xml) ?: return null
+        val v = m.groupValues[1]
+            .replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"")
+            .replace("&apos;", "'").replace("&amp;", "&").trim()
+        return v.ifEmpty { null }
+    }
+
+    private fun inspectOoxml(ins: InputStream): List<MetaField> {
+        var core: String? = null
+        var app: String? = null
+        var custom: String? = null
+        var thumbnail = false
+        ZipInputStream(ins).use { zin ->
+            var e: ZipEntry? = zin.nextEntry
+            while (e != null) {
+                val n = e.name
+                when {
+                    n.equals("docProps/core.xml", true) -> core = String(zin.readBytes(), Charsets.UTF_8)
+                    n.equals("docProps/app.xml", true) -> app = String(zin.readBytes(), Charsets.UTF_8)
+                    n.equals("docProps/custom.xml", true) -> custom = String(zin.readBytes(), Charsets.UTF_8)
+                    n.startsWith("docProps/thumbnail", true) -> thumbnail = true
+                }
+                zin.closeEntry()
+                e = zin.nextEntry
+            }
+        }
+        val out = ArrayList<MetaField>()
+        core?.let { xml ->
+            for ((tag, label) in coreTags) {
+                val v = xmlValue(xml, tag) ?: continue
+                val shown = if (tag in dateTags) v.replace('T', ' ').removeSuffix("Z") else v
+                out.add(MetaField(label, shorten(shown)))
+            }
+        }
+        app?.let { xml ->
+            for ((tag, label) in appTags) {
+                val v = xmlValue(xml, tag) ?: continue
+                out.add(MetaField(label, shorten(v)))
+            }
+            val stats = statTags.mapNotNull { t -> xmlValue(xml, t)?.let { "$t $it" } }
+            if (stats.isNotEmpty()) out.add(MetaField("Document statistics", shorten(stats.joinToString(", "))))
+        }
+        custom?.let { xml ->
+            val names = Regex("<property\\b[^>]*?name=\"([^\"]+)\"").findAll(xml).map { it.groupValues[1] }.toList()
+            out.add(MetaField("Custom properties", if (names.isEmpty()) "present" else shorten(names.joinToString(", "))))
+        }
+        if (thumbnail) out.add(MetaField("Thumbnail image", "embedded preview"))
+        return out
+    }
 
     /**
      * Cleans the file IN PLACE. No copy is created next to it.
