@@ -22,7 +22,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.documentfile.provider.DocumentFile
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -55,26 +54,24 @@ private fun displayName(ctx: Context, uri: Uri): String =
         if (it.moveToFirst()) it.getString(0) else null
     } ?: "file"
 
+/** Same picker as OpenMultipleDocuments, but also asks for write access so files can be cleaned in place. */
+private class OpenForEdit : ActivityResultContracts.OpenMultipleDocuments() {
+    override fun createIntent(context: Context, input: Array<String>): Intent =
+        super.createIntent(context, input).addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+}
+
 @Composable
 fun Screen() {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val items = remember { mutableStateListOf<Item>() }
-    var outDir by remember { mutableStateOf<Uri?>(null) }
     var busy by remember { mutableStateOf(false) }
 
-    val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+    val pickFiles = rememberLauncherForActivityResult(OpenForEdit()) { uris ->
         uris.forEach { u ->
             val n = displayName(ctx, u)
             if (MetadataCleaner.isSupported(n) && items.none { it.uri == u })
                 items.add(Item(u, n))
-        }
-    }
-    val pickDir = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
-        if (uri != null) {
-            ctx.contentResolver.takePersistableUriPermission(
-                uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            outDir = uri
         }
     }
 
@@ -85,15 +82,9 @@ fun Screen() {
         Text("Remove metadata from PDF, Word, Excel and PowerPoint files. Content stays untouched. Works 100% offline.",
             color = Blue, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp, bottom = 16.dp))
 
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedButton(onClick = { pickFiles.launch(MetadataCleaner.supported) }, enabled = !busy,
-                modifier = Modifier.weight(1f)) { Text("Select files", color = Blue) }
-            OutlinedButton(onClick = { pickDir.launch(null) }, enabled = !busy,
-                modifier = Modifier.weight(1f)) { Text("Output folder", color = Blue) }
-        }
-        Text(
-            if (outDir == null) "No output folder selected"
-            else "Output: " + (DocumentFile.fromTreeUri(ctx, outDir!!)?.name ?: ""),
+        OutlinedButton(onClick = { pickFiles.launch(MetadataCleaner.supported) }, enabled = !busy,
+            modifier = Modifier.fillMaxWidth()) { Text("Select files", color = Blue) }
+        Text("The original files are cleaned in place. No copy is created.",
             color = Blue, fontSize = 13.sp, modifier = Modifier.padding(vertical = 10.dp))
 
         LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -107,15 +98,13 @@ fun Screen() {
 
         Button(
             onClick = {
-                val dirUri = outDir ?: return@Button
-                val dir = DocumentFile.fromTreeUri(ctx, dirUri) ?: return@Button
                 busy = true
                 scope.launch {
                     for (i in items.indices) {
                         val item = items[i]
                         items[i] = item.copy(status = "Cleaning...")
                         val result = withContext(Dispatchers.IO) {
-                            try { MetadataCleaner.clean(ctx, item.uri, item.name, dir); "Done - saved as *_clean" }
+                            try { MetadataCleaner.clean(ctx, item.uri, item.name); "Done - original cleaned" }
                             catch (t: Throwable) { "Error: " + (t.message ?: t.javaClass.simpleName) }
                         }
                         items[i] = item.copy(status = result)
@@ -123,7 +112,7 @@ fun Screen() {
                     busy = false
                 }
             },
-            enabled = !busy && items.isNotEmpty() && outDir != null,
+            enabled = !busy && items.isNotEmpty(),
             modifier = Modifier.fillMaxWidth().padding(top = 12.dp).height(52.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Blue, contentColor = Bg)
         ) { Text(if (busy) "Working..." else "Clean metadata", fontWeight = FontWeight.Bold) }

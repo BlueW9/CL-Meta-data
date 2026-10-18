@@ -1,11 +1,15 @@
 package com.clmeta.metadata
 
+import android.content.ContentResolver
 import android.content.Context
 import android.net.Uri
-import androidx.documentfile.provider.DocumentFile
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.PDDocumentInformation
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
@@ -38,36 +42,76 @@ object MetadataCleaner {
     fun extensionOf(name: String) = name.substringAfterLast('.', "").lowercase()
     fun isSupported(name: String) = extensionOf(name) in mimeByExt
 
-    fun clean(ctx: Context, input: Uri, name: String, outDir: DocumentFile) {
+    /**
+     * Cleans the file IN PLACE. No copy is created next to it.
+     *
+     * To make sure the original can never be lost half-way:
+     * 1. the original bytes are kept in the app's private cache while we work,
+     * 2. the cleaned version is built and verified in the cache,
+     * 3. only then is the original overwritten,
+     * 4. if overwriting fails, the original bytes are written back.
+     * The temporary files are always deleted at the end.
+     */
+    fun clean(ctx: Context, input: Uri, name: String) {
         val ext = extensionOf(name)
-        val mime = mimeByExt[ext] ?: error("Unsupported file type (.$ext)")
-        val outName = name.substringBeforeLast('.') + "_clean." + ext
-        outDir.findFile(outName)?.delete()
-        val outFile = outDir.createFile(mime, outName) ?: error("Cannot create output file")
+        if (ext !in mimeByExt) error("Unsupported file type (.$ext)")
+        val cr = ctx.contentResolver
+        val backup = File.createTempFile("orig_", ".tmp", ctx.cacheDir)
+        val cleaned = File.createTempFile("clean_", ".tmp", ctx.cacheDir)
         try {
-            ctx.contentResolver.openInputStream(input)!!.use { ins ->
-                ctx.contentResolver.openOutputStream(outFile.uri, "w")!!.use { outs ->
-                    if (ext == "pdf") cleanPdf(ins, outs) else cleanOoxml(ins, outs)
+            val ins = cr.openInputStream(input) ?: error("Cannot read the file")
+            ins.use { src -> FileOutputStream(backup).use { dst -> src.copyTo(dst) } }
+
+            if (ext == "pdf") cleanPdf(backup, cleaned) else cleanOoxml(backup, cleaned)
+
+            val out = (try {
+                cr.openOutputStream(input, "wt")
+            } catch (e: Throwable) {
+                null
+            }) ?: error("This file is read-only for the app, so nothing was changed")
+
+            try {
+                out.use { o -> FileInputStream(cleaned).use { s -> s.copyTo(o) } }
+            } catch (e: Throwable) {
+                val restored = try {
+                    writeBack(cr, input, backup)
+                    true
+                } catch (e2: Throwable) {
+                    false
                 }
+                error(
+                    if (restored) "Could not save the cleaned file. The original was restored unchanged"
+                    else "Saving failed and the original may be damaged"
+                )
             }
-        } catch (t: Throwable) {
-            outFile.delete()
-            throw t
+        } finally {
+            backup.delete()
+            cleaned.delete()
         }
     }
 
-    private fun cleanPdf(ins: java.io.InputStream, outs: java.io.OutputStream) {
-        PDDocument.load(ins).use { doc ->
+    private fun writeBack(cr: ContentResolver, uri: Uri, from: File) {
+        val o = cr.openOutputStream(uri, "wt") ?: error("Cannot write")
+        o.use { s -> FileInputStream(from).use { it.copyTo(s) } }
+    }
+
+    private fun cleanPdf(src: File, dst: File) {
+        var pages = 0
+        PDDocument.load(src).use { doc ->
             if (doc.isEncrypted) error("Encrypted PDF is not supported")
+            pages = doc.numberOfPages
             doc.documentInformation = PDDocumentInformation()
             doc.documentCatalog.metadata = null
-            doc.save(outs)
+            FileOutputStream(dst).use { doc.save(it) }
         }
+        // Verify the result opens and has the same number of pages before touching the original.
+        PDDocument.load(dst).use { check(it.numberOfPages == pages) { "Verification failed" } }
     }
 
-    private fun cleanOoxml(ins: java.io.InputStream, outs: java.io.OutputStream) {
-        ZipInputStream(ins).use { zin ->
-            ZipOutputStream(outs).use { zout ->
+    private fun cleanOoxml(src: File, dst: File) {
+        var written = 0
+        ZipInputStream(FileInputStream(src).buffered()).use { zin ->
+            ZipOutputStream(FileOutputStream(dst).buffered()).use { zout ->
                 var e: ZipEntry? = zin.nextEntry
                 while (e != null) {
                     val n = e.name
@@ -75,6 +119,7 @@ object MetadataCleaner {
                             n.startsWith("docProps/thumbnail", true)
                     if (!skip) {
                         zout.putNextEntry(ZipEntry(n))
+                        written++
                         if (!e.isDirectory) {
                             when (n) {
                                 "docProps/core.xml" -> zout.write(EMPTY_CORE.toByteArray())
@@ -92,6 +137,10 @@ object MetadataCleaner {
                     e = zin.nextEntry
                 }
             }
+        }
+        // Verify the result is a valid package with every entry before touching the original.
+        ZipFile(dst).use { z ->
+            check(z.size() == written && z.getEntry("[Content_Types].xml") != null) { "Verification failed" }
         }
     }
 }
