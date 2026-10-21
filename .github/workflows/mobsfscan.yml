@@ -1,0 +1,25 @@
+name: mobsfscan
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '41 3 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+  security-events: write
+jobs:
+  mobsfscan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install mobsfscan
+      # Findings are reported in the Security tab instead of failing the build.
+      - run: mobsfscan --type android --sarif --output results.sarif . || true
+      - uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: results.sarif
+          category: mobsfscan

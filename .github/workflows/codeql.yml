@@ -1,0 +1,31 @@
+name: CodeQL
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+  security-events: write
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: java-kotlin
+          build-mode: manual
+      # A debug build is enough for the analysis, so no signing key is needed here.
+      - run: gradle assembleDebug --no-daemon
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:java-kotlin"
