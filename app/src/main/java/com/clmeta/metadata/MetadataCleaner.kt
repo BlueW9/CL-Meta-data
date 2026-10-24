@@ -20,6 +20,16 @@ class CleanReport(val before: List<MetaField>, val after: List<MetaField>, val c
 
 object MetadataCleaner {
 
+    private val GROUP_ORDER = listOf("Identity", "Dates", "Software", "XMP", "Custom", "Hidden")
+
+    fun inspect(ctx: Context, input: Uri, name: String): List<MetaField> {
+        val entries = MetaReader.read(ctx, input)
+            .filter { it.group != "Format" && it.group != "Error" && it.label != "Embedded media files" && it.label != "Save markers" }
+            .sortedBy { val i = GROUP_ORDER.indexOf(it.group); if (i < 0) 99 else i }
+        if (entries.isEmpty()) return inspectLegacy(ctx, input, name)
+        return entries.map { MetaField(it.group + ": " + it.label, it.value) }
+    }
+
     val supported = arrayOf(
         "application/pdf",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -68,7 +78,7 @@ object MetadataCleaner {
     private val pdfDateRegex = Regex("""D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?""")
 
     /** Lists the metadata found in the file. An empty list means the file is clean. */
-    fun inspect(ctx: Context, input: Uri, name: String): List<MetaField> {
+    private fun inspectLegacy(ctx: Context, input: Uri, name: String): List<MetaField> {
         val ext = extensionOf(name)
         if (ext !in mimeByExt) error("Unsupported file type (.$ext)")
         val ins = ctx.contentResolver.openInputStream(input) ?: error("Cannot read the file")

@@ -146,11 +146,11 @@ fun Screen() {
                     if (item.fields.isNotEmpty()) {
                         Text(item.listTitle, color = Blue, fontSize = 12.sp, fontWeight = FontWeight.Medium,
                             modifier = Modifier.padding(top = 8.dp, bottom = 2.dp))
-                        item.fields.take(14).forEach { f ->
+                        item.fields.take(40).forEach { f ->
                             Text("\u2022 " + f.label + ": " + f.value, color = Blue, fontSize = 12.sp)
                         }
-                        if (item.fields.size > 14)
-                            Text("+ " + (item.fields.size - 14) + " more", color = Blue, fontSize = 12.sp)
+                        if (item.fields.size > 40)
+                            Text("+ " + (item.fields.size - 40) + " more", color = Blue, fontSize = 12.sp)
                     }
                 }
             }
